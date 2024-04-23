@@ -32,9 +32,11 @@ from transformers.generation.stopping_criteria import (
 )
 from transformers.generation.utils import (
     NEED_SETUP_CACHE_CLASSES_MAPPING,
+    AssistedCandidateGenerator,
     GenerateBeamDecoderOnlyOutput,
     GenerateBeamEncoderDecoderOutput,
     GenerateBeamOutput,
+    GenerationConfig,
     GenerateDecoderOnlyOutput,
     GenerateEncoderDecoderOutput,
     GenerateNonBeamOutput,
@@ -3574,7 +3576,7 @@ class GaudiGenerationMixin(GenerationMixin):
         return candidate_generator
 
 class GaudiAssistedCandidateGenerator(AssistedCandidateGenerator):
-    def __init__(self, *args, *, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_kwargs = kwargs["model_kwargs"]
 
