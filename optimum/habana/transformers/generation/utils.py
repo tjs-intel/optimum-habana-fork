@@ -24,15 +24,15 @@ import torch
 import torch.distributed as dist
 from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
-from transformers.generation.candidate_generator import CandidateGenerator
+from transformers.generation.candidate_generator import CandidateGenerator, AssistedCandidateGenerator
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (
+    EosTokenCriteria,
     StoppingCriteriaList,
     validate_stopping_criteria,
 )
 from transformers.generation.utils import (
     NEED_SETUP_CACHE_CLASSES_MAPPING,
-    AssistedCandidateGenerator,
     GenerateBeamDecoderOnlyOutput,
     GenerateBeamEncoderDecoderOutput,
     GenerateBeamOutput,
