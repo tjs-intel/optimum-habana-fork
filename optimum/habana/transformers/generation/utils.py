@@ -569,13 +569,6 @@ class GaudiGenerationMixin(GenerationMixin):
         else:
             model_kwargs["use_cache"] = generation_config.use_cache
         self.generation_config.max_length = generation_config.max_length
-        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
-        requires_attention_mask = "encoder_outputs" not in model_kwargs
-
-        if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
-            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
-                inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
-            )
 
         is_greedy_or_beam_and_bucket = (
             not generation_config.bucket_internal
@@ -3314,6 +3307,7 @@ class GaudiGenerationMixin(GenerationMixin):
         >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
         ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
         ```"""
+        # reference implementation: https://github.com/huggingface/transformers/blob/e74d793a3c3c0bc9bf3fb94bb31dd16934b1b0db/src/transformers/generation/utils.py#L4476
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
@@ -3369,16 +3363,13 @@ class GaudiGenerationMixin(GenerationMixin):
             )
 
         # keep track of which sequences are already finished
-        batch_size, cur_len = input_ids.shape
-        if "inputs_embeds" in model_kwargs:
-            cur_len = model_kwargs["inputs_embeds"].shape[1]
+        batch_size = input_ids.shape[0]
+        cur_len = model_kwargs["token_idx"] if token_idx in model_kwargs else 0
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
+        model_kwargs["cache_position"] = torch.arange(input_ids.shape[-1], device=input_ids.device)
 
         this_peer_finished = False
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-            cur_len = input_ids.shape[-1]
-
             #  1. Fetch candidate sequences from a `CandidateGenerator`
             candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids)
             candidate_input_ids = candidate_input_ids.to(self.device)
@@ -3397,14 +3388,6 @@ class GaudiGenerationMixin(GenerationMixin):
                 model_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
             )
             model_kwargs = _prepare_token_type_ids(model_kwargs, candidate_input_ids.shape[1])
-            if "cache_position" in model_kwargs:
-                model_kwargs["cache_position"] = torch.cat(
-                    (
-                        model_kwargs["cache_position"],
-                        torch.arange(cur_len, cur_len + candidate_length, device=input_ids.device, dtype=torch.long),
-                    ),
-                    dim=0,
-                )
 
             model_inputs = self.prepare_inputs_for_generation(candidate_input_ids, **model_kwargs)
             if "num_logits_to_keep" in model_inputs:
@@ -3564,3 +3547,84 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
         else:
             return input_ids
+
+    def _get_candidate_generator(
+        self,
+        generation_config: GenerationConfig,
+        input_ids: torch.LongTensor,
+        inputs_tensor: torch.Tensor,
+        assistant_model: "PreTrainedModel",
+        logits_processor: LogitsProcessorList,
+        model_kwargs: Dict,
+    ) -> CandidateGenerator:
+        """
+        Returns the candidate generator to be used in `assisted_generation`
+        """
+        if generation_config.prompt_lookup_num_tokens is not None:
+            raise NotImplementedError("Assisted generation with prompt lookup not yet supported")
+        else:
+            candidate_generator = GaudiAssistedCandidateGenerator(
+                input_ids=input_ids,
+                assistant_model=assistant_model,
+                generation_config=generation_config,
+                logits_processor=logits_processor,
+                model_kwargs=model_kwargs,
+                inputs_tensor=inputs_tensor,
+            )
+        return candidate_generator
+
+class GaudiAssistedCandidateGenerator(AssistedCandidateGenerator):
+    def __init__(self, *args, *, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_kwargs = kwargs["model_kwargs"]
+
+    def get_candidates(self, input_ids: torch.LongTensor) -> Tuple[torch.LongTensor, Optional[torch.FloatTensor]]:
+        """
+        Fetches the candidates to be tried for the current input.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. [What are input IDs?](../glossary#input-ids)
+
+        Return:
+            `torch.LongTensor` of shape `(batch_size, candidate_length)` containing the candidate sequences to be
+            assessed by the model and a `torch.FloatTensor` of shape `(batch_size, candidate_length,
+            vocabulary_size)` containing the logits associated to each candidate.
+        """
+        input_ids = input_ids.to(self.assistant_model.device)
+
+        # Don't generate more than `max_length - 1` candidates since the target model generates one extra token.
+        new_cur_len = self.model_kwargs["token_idx"] if "token_idx" in self.model_kwargs else 0
+        max_new_tokens = min(int(self.num_assistant_tokens), self.generation_config.max_length - new_cur_len - 1)
+        min_new_tokens = max(min(max_new_tokens, self.main_model_min_length - new_cur_len), 0)
+        if max_new_tokens == 0:
+            return input_ids, None
+
+        # 1. If it is not the first round of candidate generation, prepare the inputs based on the input_ids length
+        # (which implicitly contains the number of accepted candidates from the previous round)
+        has_past_key_values = self.assistant_kwargs.get("past_key_values", None) is not None
+        if has_past_key_values:
+            new_cache_size = new_cur_len - 1
+            self.assistant_kwargs["past_key_values"] = _crop_past_key_values(
+                self.assistant_model, self.assistant_kwargs["past_key_values"], new_cache_size - 1
+            )  # the assistant does not have the token after the last match, hence the -1
+
+        # 2. Forecast next N tokens using the assistant model.
+        assistant_generation_kwargs = {
+            self.input_ids_key: input_ids,
+            "min_new_tokens": min_new_tokens,
+            "max_new_tokens": max_new_tokens,
+            "generation_config": self.generation_config,
+            "logits_processor": self.logits_processor,
+            "token_idx": new_cur_len,
+        }
+
+        assistant_output = self.assistant_model.generate(**assistant_generation_kwargs, **self.assistant_kwargs)
+
+        # 3. Update variables for the next round of candidate generation
+        self.assistant_kwargs["past_key_values"] = assistant_output.past_key_values
+
+        # 4. Prepare variables for output
+        candidate_logits = torch.stack(assistant_output.scores, dim=1)
+        candidate_ids = assistant_output.sequences
+        return candidate_ids, candidate_logits
