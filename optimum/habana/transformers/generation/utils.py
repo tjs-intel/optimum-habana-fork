@@ -24,10 +24,9 @@ import torch
 import torch.distributed as dist
 from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
-from transformers.generation.candidate_generator import CandidateGenerator, AssistedCandidateGenerator
+from transformers.generation.candidate_generator import CandidateGenerator, AssistedCandidateGenerator, _crop_past_key_values
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (
-    EosTokenCriteria,
     StoppingCriteriaList,
     validate_stopping_criteria,
 )
@@ -3310,32 +3309,35 @@ class GaudiGenerationMixin(GenerationMixin):
         ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
         ```"""
         # reference implementation: https://github.com/huggingface/transformers/blob/e74d793a3c3c0bc9bf3fb94bb31dd16934b1b0db/src/transformers/generation/utils.py#L4476
+        # handling deprecated arguments
+        if (assistant_model is None) == (candidate_generator is None):
+            raise ValueError("One (and only one) of `assistant_model` and `candidate_generator` should be defined.")
+
+        if assistant_model is not None:
+            candidate_generator = AssistedCandidateGenerator(
+                input_ids=input_ids,
+                assistant_model=assistant_model,
+                logits_processor=logits_processor,
+                model_kwargs=model_kwargs,
+                eos_token_id=eos_token_id,
+            )
+            warnings.warn(
+                "Passing `assistant_model` to `assisted_decoding` is deprecated and will be removed in v4.38. "
+                "Pass the `candidate_generator` argument instead.",
+                FutureWarning,
+            )
+
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-        if eos_token_id is not None:
-            logger.warning_once(
-                "`eos_token_id` is deprecated in this function and will be removed in v4.41, use"
-                " `stopping_criteria=StoppingCriteriaList([EosTokenCriteria(eos_token_id=eos_token_id)])` instead."
-                " Otherwise make sure to set `model.generation_config.eos_token_id`",
-                FutureWarning,
-            )
-            stopping_criteria.append(EosTokenCriteria(eos_token_id=eos_token_id))
-        else:
-            # TODO remove when the method is totally private and beam scorer refactored
-            # need to get `eos_token_id` and add stopping criteria, so that generation does not go forever
-            eos_token_id = [
-                criteria.eos_token_id.tolist() for criteria in stopping_criteria if hasattr(criteria, "eos_token_id")
-            ]
-            eos_token_id = eos_token_id[0] if eos_token_id else None
-            if eos_token_id is None and self.generation_config.eos_token_id is not None:
-                eos_token_id = self.generation_config.eos_token_id
-                stopping_criteria.append(EosTokenCriteria(eos_token_id=eos_token_id))
-
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        if eos_token_id is not None and pad_token_id is None:
+            raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
+        eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
         output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
         output_logits = output_logits if output_logits is not None else self.generation_config.output_logits
         output_attentions = (
@@ -3365,35 +3367,48 @@ class GaudiGenerationMixin(GenerationMixin):
             )
 
         # keep track of which sequences are already finished
-        batch_size = input_ids.shape[0]
-        cur_len = model_kwargs["token_idx"] if token_idx in model_kwargs else 0
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs["cache_position"] = torch.arange(input_ids.shape[-1], device=input_ids.device)
+        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
 
-        this_peer_finished = False
-        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+        # other auxiliary variables
+        max_len = stopping_criteria[0].max_length
+
+        this_peer_finished = False  # used by synced_gpus only
+        cur_len = model_kwargs["token_idx"] if token_idx in model_kwargs else 0
+        while True:
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
             #  1. Fetch candidate sequences from a `CandidateGenerator`
             candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids)
             candidate_input_ids = candidate_input_ids.to(self.device)
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(self.device)
 
-            candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
-            is_done_candidate = stopping_criteria(candidate_input_ids, None)
+            candidate_length = candidate_input_ids.shape[1] - cur_len
+            last_assistant_token_is_eos = (
+                ~candidate_input_ids[:, -1]
+                .tile(eos_token_id_tensor.shape[0], 1)
+                .ne(eos_token_id_tensor.unsqueeze(1))
+                .prod(dim=0)
+                .bool()
+            )
 
             # 2. Use the original model to obtain the next token logits given the candidate sequence. We obtain
             # `candidate_length + 1` relevant logits from this process: in the event that all candidates are correct,
             # we use this forward pass to also pick the subsequent logits in the original model.
 
             # 2.1. Prepare the model inputs
-            model_kwargs = _prepare_attention_mask(
-                model_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
-            )
-            model_kwargs = _prepare_token_type_ids(model_kwargs, candidate_input_ids.shape[1])
+            candidate_kwargs = copy.copy(model_kwargs)
+            candidate_kwargs["token_idx"] = cur_len
 
-            model_inputs = self.prepare_inputs_for_generation(candidate_input_ids, **model_kwargs)
-            if "num_logits_to_keep" in model_inputs:
-                model_inputs["num_logits_to_keep"] = candidate_length + 1
+            model_inputs = self.prepare_inputs_for_generation(candidate_input_ids, **candidate_kwargs)
 
             # 2.2. Run a forward pass on the candidate sequence
             outputs = self(
@@ -3415,13 +3430,15 @@ class GaudiGenerationMixin(GenerationMixin):
             # 3. Select the accepted tokens. There are two possible cases:
             # Case 1: `do_sample=True` and we have logits for the candidates (originally from speculative decoding)
             # 👉 Apply algorithm 1 from the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf).
+            max_matches = max_len - cur_len - 1
             if do_sample and candidate_logits is not None:
                 valid_tokens, n_matches = _speculative_sampling(
                     candidate_input_ids,
                     candidate_logits,
                     candidate_length,
                     new_logits,
-                    is_done_candidate,
+                    last_assistant_token_is_eos,
+                    max_matches,
                 )
 
             # Case 2: all other cases (originally from assisted generation) 👉 Compare the tokens selected from the
@@ -3438,8 +3455,9 @@ class GaudiGenerationMixin(GenerationMixin):
                 n_matches = ((~(candidate_new_tokens == selected_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
 
                 # Ensure we don't generate beyond max_len or an EOS token
-                if is_done_candidate and n_matches == candidate_length:
+                if last_assistant_token_is_eos and n_matches == candidate_length:
                     n_matches -= 1
+                n_matches = min(n_matches, max_matches)
                 valid_tokens = selected_tokens[:, : n_matches + 1]
 
             # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
@@ -3448,10 +3466,11 @@ class GaudiGenerationMixin(GenerationMixin):
             # is no match.
 
             # 4.1. Get the valid continuation, after the matching tokens
-            input_ids = torch.cat((input_ids, valid_tokens), dim=-1)
+            input_ids = torch.clone(input_ids)
+            input_ids[:, cur_len:cur_len + valid_tokens.shape[1]] = valid_tokens
             if streamer is not None:
                 streamer.put(valid_tokens.cpu())
-            new_cur_len = input_ids.shape[-1]
+            new_cur_len = cur_len + valid_tokens.shape[1]
 
             # 4.2. Discard past key values relative to unused assistant tokens
             new_cache_size = new_cur_len - 1
@@ -3507,13 +3526,28 @@ class GaudiGenerationMixin(GenerationMixin):
                         )
 
             model_kwargs = self._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=self.config.is_encoder_decoder,
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
 
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
-            this_peer_finished = unfinished_sequences.max() == 0
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    input_ids[:, -1]
+                    .tile(eos_token_id_tensor.shape[0], 1)
+                    .ne(eos_token_id_tensor.unsqueeze(1))
+                    .prod(dim=0)
+                )
+
+                # stop when each sentence is finished
+                if unfinished_sequences.max() == 0:
+                    this_peer_finished = True
+
+            # stop if we exceed the maximum length
+            if stopping_criteria(input_ids, scores):
+                this_peer_finished = True
+
+            if this_peer_finished and not synced_gpus:
+                break
 
         if streamer is not None:
             streamer.end()
@@ -3630,3 +3664,63 @@ class GaudiAssistedCandidateGenerator(AssistedCandidateGenerator):
         candidate_logits = torch.stack(assistant_output.scores, dim=1)
         candidate_ids = assistant_output.sequences
         return candidate_ids, candidate_logits
+
+def _speculative_sampling(
+    candidate_input_ids,
+    candidate_logits,
+    candidate_length,
+    new_logits,
+    last_assistant_token_is_eos,
+    max_matches,
+):
+    """
+    Applies sampling as in the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf, algorithm 1). Returns
+    the selected tokens, as well as the number of candidate matches.
+
+    NOTE: Unless otherwise stated, the variable names match those in the paper.
+    """
+    new_candidate_input_ids = candidate_input_ids[:, -candidate_length:]
+    # Gets the probabilities from the logits. q_i and p_i denote the assistant and model probabilities of the tokens
+    # selected by the assistant, respectively.
+    arange = torch.arange(candidate_input_ids.shape[-1])
+    q = candidate_logits.softmax(dim=-1)
+    q_i = q[:, arange, candidate_input_ids]
+    p = new_logits.softmax(dim=-1)
+    p_i = p[:, arange, candidate_input_ids]
+    probability_ratio = p_i / q_i
+    probability_ratio[:, :-candidate_length] = 1
+
+    # When probability_ratio > 1 (i.e. q_i(x) < p_i(x), or "assistant probability of the candidate token is smaller
+    # than the model probability for the same token"), keep the token. Otherwise reject with p = 1 - probability_ratio
+    # (= keep with p = probability_ratio). Keep all the tokens until the first rejection
+    r_i = torch.rand_like(probability_ratio)
+    is_accepted = r_i <= probability_ratio
+    n_matches = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+
+    # Ensure we don't generate beyond max_len or an EOS token (not in algorithm 1, but needed for correct behavior)
+    if last_assistant_token_is_eos and n_matches == candidate_length:
+        # Output length is assumed to be `n_matches + 1`. Since we won't generate another token with the target model
+        # due to acceptance on EOS we fix `n_matches`
+        n_matches -= 1
+        valid_tokens = new_candidate_input_ids[:, : n_matches + 1]
+    else:
+        n_matches = min(n_matches, max_matches)
+
+        # Next token selection: if there is a rejection, adjust the distribution from the main model before sampling.
+        gamma = min(candidate_logits.shape[1], max_matches)
+        p_n_plus_1 = p[:, n_matches, :]
+        if n_matches < gamma:
+            q_n_plus_1 = q[:, n_matches, :]
+            p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0)
+            p_prime.div_(p_prime.sum())
+        else:
+            p_prime = p_n_plus_1
+        t = torch.multinomial(p_prime, num_samples=1).squeeze(1)[None, :]
+
+        # The selected tokens include the matches (if any) plus the next sampled tokens
+        if n_matches > 0:
+            valid_tokens = torch.cat((new_candidate_input_ids[:, :n_matches], t), dim=-1)
+        else:
+            valid_tokens = t
+
+    return valid_tokens, n_matches
